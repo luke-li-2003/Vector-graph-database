@@ -1,0 +1,3 @@
+Vendored unmodified headers and LICENSE from nmslib/hnswlib v0.8.0.
+Source: https://github.com/nmslib/hnswlib/tree/v0.8.0
+Archive SHA-256: cf61d7dd8dc9bfba7f4abe0ed26698e90ac9f49a0badb2e1b0f3ba89b72cf3bb
