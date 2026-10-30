@@ -1,5 +1,6 @@
 #pragma once
 #include "vgraph/vector.hpp"
+#include <memory>
 #include <string>
 #include <vector>
 namespace vgraph {
@@ -8,7 +9,14 @@ struct PersonId {
     friend bool operator==(PersonId a, PersonId b) { return a.value == b.value; }
     friend bool operator<(PersonId a, PersonId b) { return a.value < b.value; }
 };
-struct Person { PersonId id; std::string name; };
+class AuthorHnsw;
+struct HnswConfig;
+struct Person {
+    PersonId id;
+    std::string name;
+    // Derived, immutable index of this person's posts; null until built (or invalidated).
+    std::shared_ptr<const AuthorHnsw> hnsw;
+};
 struct Post { PostId id; PersonId author; std::string text; };
 class Database {
 public:
@@ -30,6 +38,10 @@ public:
     const VectorStore& vectors() const { return vectors_; }
     std::size_t person_count() const { return people_.size(); }
     std::size_t post_count() const { return posts_.size(); }
+    // Build all author indexes and attach them as person metadata. Not serialized.
+    // Adding a post invalidates only that author's index. Rebuild before using it.
+    void build_author_hnsw();
+    void build_author_hnsw(const HnswConfig&);
     // Portable versioned text snapshot. Refuses to overwrite an existing path.
     void save(const std::string& path) const;
     static Database load(const std::string& path);

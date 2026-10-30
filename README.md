@@ -34,7 +34,7 @@ post=1 author=Bob squared_l2=0 text=Graph databases
 post=2 author=Bob squared_l2=0.08 text=Vector storage
 ```
 
-## Hybrid search with an HNSW pre-filter
+## Hybrid search with merged author HNSWs
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -49,11 +49,38 @@ cmake --build build -j2
 
 The query means: find the nearest posts authored by people reachable from the
 anchor in 1..hops directed `knows` edges. The anchor is excluded even on cycles.
-The pipeline is **graph traversal -> materialized eligible-post bitmap ->
-filtered HNSW search** over a global index. This is a precomputed graph filter
-applied *during* ANN search, not filtering a global top-k afterward. HNSW can
-navigate through ineligible posts; only eligible posts can enter the result set.
-It does not build a separate HNSW index for each eligible subset.
+The default pipeline is **graph traversal -> select author HNSWs -> witness
+clique overlay -> HNSW search**. Each person has an `hnsw` metadata field holding
+an immutable index of exactly their own posts. These small indexes are built once
+and reused across author subsets. For each query:
+
+1. Traverse `knows` to get the eligible authors, excluding the anchor.
+2. Select one vertex uniformly at random from the highest occupied layer of each
+   nonempty author's HNSW. A shard with no upper layers uses layer 0; an author
+   with no posts contributes no witness.
+3. Connect every pair of witnesses bidirectionally at all layers they share,
+   including layer 0. This handles unequal shard heights without promoting
+   vertices or introducing artificial vector nodes. These extra edges form a
+   complete graph at layer 0 and are not pruned to M.
+4. Start at a witness on the highest selected layer. Use HNSW greedy descent on
+   upper layers, then an `ef`-bounded best-first search at layer 0, returning the
+   nearest k visited posts.
+
+The merged graph contains only selected authors' posts. It is a query-local
+overlay: local topology is reused, witness edges are enumerated on demand, and
+no author index is mutated. It performs one search on the union, rather than
+independent searches whose results are combined. No global post bitmap, global
+HNSW, merged-index reconstruction, or exact fallback is used in this mode.
+
+The original global filtered index remains available as a comparison:
+
+```sh
+./build/vgraph_search hnsw-example.vg --index global --anchor 7 --hops 2 --k 10 --ef 200 --compare-exact
+```
+
+`--index global` uses **graph traversal -> materialized eligible-post bitmap ->
+filtered global HNSW search**. It can navigate through ineligible posts but only
+return eligible ones. `--index author` is the default and uses the witness union.
 
 The default query is `[1,0,...]`. Supply a real numerical vector as exactly
 `dimension` whitespace-separated finite floats in a file:
@@ -67,15 +94,28 @@ The default query is `[1,0,...]`. Supply a real numerical vector as exactly
 
 `--query-file` and `--query-post` are mutually exclusive. Existing-post queries
 are useful for checks, but use held-out query vectors for research measurements.
-Options: `--anchor 0`, `--hops 1`, `--k 10`, `--ef 100`, `--m 16`,
+Options: `--index author`, `--anchor 0`, `--hops 1`, `--k 10`, `--ef 100`, `--m 16`,
 `--ef-construction 200`, `--seed 42` are defaults. M must be 2..10000; both ef
 values must be positive. hnswlib uses at least M for construction breadth and
 at least the requested k for search breadth. Increasing `--ef` generally trades
-more work for better recall. Selective filters may make traversal expensive.
+more work for better recall. The seed controls author index construction and
+query-local witness selection. Identical author sets and seeds choose the same
+witnesses regardless of input author order or duplicates; vary the seed to sample
+different witnesses. The local construction RNG stream differs per author.
 
-Output separates snapshot loading, global index construction, graph-filter
-materialization, and vector-search timings. `--compare-exact` runs the same
-materialized graph filter with exact search, prints exact hits, and reports
+Output separates snapshot loading, index construction, graph traversal, witness
+merging (`merge_ms`), and vector search. It also reports witness count. In global
+mode, graph timing includes post-bitmap materialization and merge timing is zero.
+The CLI flushes stage messages for loading, index completion, searching, and
+exact comparison. Global construction also reports inserted/total posts, percent,
+and elapsed seconds about once per second (checked every 1,000 insertions).
+`synthetic.vg` can contain a million 128-dimensional posts: building the global
+index is a substantial single-threaded job, repeated on every invocation.
+`--ef` controls query breadth; it does not reduce construction time, which uses
+`--ef-construction`. Build checkpoints are also available to library callers as
+the optional third `HnswSearch` constructor argument (`HnswBuildProgress`).
+`--compare-exact` evaluates the same author predicate with the materialized exact
+baseline, prints exact hits, and reports
 ID-overlap recall against `min(k, eligible_posts)` exact results. Empty ground
 truth reports recall as n/a. Exact search breaks equal-distance ties by PostId;
 HNSW may choose a different subset at a tied cutoff, lowering ID-overlap recall.
@@ -90,7 +130,7 @@ SIMD throughput. Upstream manual vectorization/prefetch is disabled via
 `NO_MANUAL_VECTORIZATION` because v0.8.0 prefetch neighbor reads trigger ASan
 at a full adjacency list. Vendored headers themselves are unmodified.
 
-Library use (reuse the index across queries):
+Library use (reuse author metadata across queries):
 
 ```cpp
 #include "vgraph/hnsw.hpp"
@@ -98,29 +138,52 @@ Library use (reuse the index across queries):
 auto db = vgraph::Database::load("synthetic.vg");
 vgraph::HnswConfig config;
 config.ef_search = 200;
-vgraph::HnswSearch index(db.vectors(), config);
+db.build_author_hnsw(config);
 std::vector<float> query(db.vectors().dimension(), 0.0f);
 query[0] = 1.0f;
-auto result = vgraph::hybrid_search(db, index, vgraph::PersonId{0}, 1, query, 10);
-// result.hits, eligible_authors, eligible_posts, graph_ms, vector_ms
+auto result = vgraph::merged_hnsw_search(db, vgraph::PersonId{0}, 1, query, 10, config);
+// result.hits, eligible_authors, eligible_posts, witnesses, graph_ms, merge_ms, vector_ms
+
+// Or supply any explicit author subset (input is validated and deduplicated):
+vgraph::MergedHnswSearch merged(db, {vgraph::PersonId{1}, vgraph::PersonId{3}}, config);
+auto hits = merged.search(query, 10);
+// merged.witnesses(), merged.neighbors(post, level) expose the query topology.
 ```
 
-`HnswSearch` implements `VectorSearch`, so it can also accept `author_filter`
-for future lazy-filter comparisons. `hybrid_search` deliberately materializes
-post IDs and an O(post_count) bitmap. Zero k and empty eligible sets skip the
-vector backend after graph/query validation.
+`Database::build_author_hnsw()` also accepts default configuration. It constructs
+one shard at a time with hnswlib, extracts compact immutable adjacency, and
+discards the temporary index, its vector copies, and its large lock tables.
+Author metadata retains topology and global post IDs, using the database's
+existing vectors during search. This avoids retaining hnswlib's fixed 65,536-lock
+table for every author. Empty authors receive an empty index. Builds publish all
+metadata together after success. Copying/moving a database with metadata is safe;
+the metadata has no source pointers, and copies share immutable topology.
 
-The index copies vectors and adds topology and bookkeeping; allow additional
-memory beyond database vector storage. Building a million-post index can take
-substantial time. The CLI rebuilds the global index on every invocation; timings
-for graph and HNSW search exclude that construction time. Index persistence and
-incremental index updates are not implemented. Database snapshots still store
-only graph and vectors. Rebuild HNSW after loading or adding posts. Appended-post
-and different-source-store searches throw; the database/store must otherwise
-remain alive, at the same address, and unmodified/unassigned for the index's
-lifetime. Moving/replacing a store is unsupported. Graph-only edge additions
-are allowed between queries and reflected in newly evaluated filters. Concurrent
-mutation is unsupported.
+Merging uses O(selected authors) storage. The complete witness clique has
+quadratic edge count; enumerating many witness neighborhoods can be expensive.
+Witness distances can be poor routing hints for authors with widely spread
+posts, so small ef values can miss promising shards. The algorithm is
+approximate even when all eligibility constraints are exact. In particular,
+very sparse local HNSWs can contain posts unreachable from the query entry;
+raising ef cannot recover those posts. This is a research
+prototype, not a claim of better recall or latency than global HNSW.
+
+The original `HnswSearch` and `ExactL2Search` implement `VectorSearch`, and work
+with `hybrid_search` and `author_filter`. That API materializes post IDs and an
+O(post_count) bitmap before calling the backend. A standalone global index is
+constructed with `HnswSearch index(db.vectors(), config)`.
+
+The CLI rebuilds indexes on every invocation; query timings exclude that
+construction time. Snapshots still store only graph and vectors, so rebuild
+author metadata after loading. Adding a post invalidates that author's metadata;
+queries selecting it throw until rebuilt, while other authors remain usable.
+Adding a person requires building metadata before selecting that person. There
+are no incremental topology updates. Already-created merged views reject searches
+after any post append. Keep their database alive, at the same address, and
+unmodified/unassigned for their lifetime. Global indexes similarly reject
+appended-post and different-source-store searches and borrow a fixed-address
+store. Graph-only edge additions are allowed between queries and reflected in
+newly evaluated author filters. Concurrent mutation is unsupported.
 
 Dependency provenance and license: `third_party/hnswlib/NOTICE.md` and
 `third_party/hnswlib/LICENSE`. Upstream source:
@@ -226,7 +289,7 @@ baselines; neither demonstrates ANN acceleration or a research contribution.
 
 - `PersonId` and `PostId` are distinct aggregate types with dense, stable 32-bit
   values assigned from zero. IDs are database-local, not globally unique.
-- Person has a name; Post has text and exactly one existing Person author.
+- Person has a name and optional derived `hnsw` metadata; Post has text and exactly one existing Person author.
   Author adjacency represents `Person -> authored -> Post`; `post(id).author`
   provides the reverse lookup. Embeddings live separately in `VectorStore`.
 - Embedding dimension is 1..65536. Insertions and queries reject dimension
@@ -277,9 +340,9 @@ include/vgraph/database.hpp  Typed graph and query API
 include/vgraph/vector.hpp    VectorStore, VectorSearch, ExactL2Search
 src/database.cpp            Graph operations and snapshots
 src/vector.cpp              Vector validation and exact top-k search
-include/vgraph/hnsw.hpp      HNSW configuration and backend API
-include/vgraph/hybrid.hpp    Materialized graph-filter query API
-src/hnsw.cpp                hnswlib adapter and double L2 space
+include/vgraph/hnsw.hpp      Global, author, and merged HNSW APIs
+include/vgraph/hybrid.hpp    Global-filter and author-merged query APIs
+src/hnsw.cpp                hnswlib construction, compact topology, witness overlay/search
 src/hybrid.cpp              Hybrid query execution
 src/search_main.cpp         HNSW search CLI
 third_party/hnswlib/         Vendored headers, license, provenance
@@ -290,8 +353,9 @@ tests/tests.cpp            Graph, search, persistence, and failure tests
 ```
 
 `HnswSearch` and `ExactL2Search` implement the same `VectorSearch` interface.
-ANN topology stays separate from graph/vector storage. Graph-derived seeds or
-joint navigation would need an additional interface later.
+`MergedHnswSearch` accepts an author subset directly and searches the union of
+the indexes attached to those graph nodes. Person metadata owns author topology;
+the merged view adds query-local witness links.
 
 Insertion uses geometrically grown arrays. Reachability is O(V + visited edges)
 with O(V) scratch space; materializing posts also allocates an author bitmap.
@@ -330,6 +394,12 @@ HNSW tests cover filtered-vs-postfiltered semantics, no eligible posts, k=0,
 k exceeding eligible count, hop limits, invalid configuration/query/anchor,
 empty indexes, source mismatch, stale index rejection and rebuild, extreme
 finite vectors, and high-ef agreement with exact search on seeded random data.
+Author HNSW tests additionally check metadata membership, top-layer witness
+sampling, complete bidirectional links at shared levels, unequal shard heights,
+author deduplication, isolated/singleton/empty shards, exclusion of unselected
+posts, overlays leaving metadata intact, invalidation and rebuilds, copied/moved
+databases, snapshot rebuilding, and high-ef agreement on uniform and clustered
+data.
 In environments where LeakSanitizer cannot run under ptrace, use:
 
 ```sh

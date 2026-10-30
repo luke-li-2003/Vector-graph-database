@@ -21,7 +21,7 @@ PersonId Database::add_person(std::string name) {
     check_capacity(people_.size());
     reserve_one(people_); reserve_one(knows_); reserve_one(authored_);
     PersonId id{static_cast<std::uint32_t>(people_.size())};
-    people_.push_back({id, std::move(name)}); knows_.emplace_back(); authored_.emplace_back();
+    people_.push_back({id, std::move(name), {}}); knows_.emplace_back(); authored_.emplace_back();
     return id;
 }
 PostId Database::add_post(PersonId author, std::string text, const std::vector<float>& embedding) {
@@ -30,6 +30,7 @@ PostId Database::add_post(PersonId author, std::string text, const std::vector<f
     PostId id{static_cast<std::uint32_t>(posts_.size())};
     posts_.push_back({id, author, std::move(text)});
     authored_[author.value].push_back(id); vectors_.append(embedding);
+    people_[author.value].hnsw.reset();
     return id;
 }
 const Person& Database::person(PersonId id) const { return people_.at(id.value); }
